@@ -1,0 +1,10 @@
+.npmrc
+app/.npmrc
+.git
+.github
+terraform
+*.tfstate
+*.tfstate.backup
+.terraform
+node_modules
+npm-debug.log*
