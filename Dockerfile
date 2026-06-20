@@ -1,4 +1,6 @@
-FROM node:20-alpine
+FROM node:20-alpine3.21
+
+RUN apk upgrade --no-cache
 
 WORKDIR /usr/src/app
 
