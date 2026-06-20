@@ -112,17 +112,18 @@ jobs:
       - name: Wait for image scan to complete
         run: |
           for attempt in {1..18}; do
-            status=$(aws ecr describe-image-scan-findings \
+            STATUS=$(aws ecr describe-image-scan-findings \
               --repository-name $ECR_REPOSITORY \
               --image-id imageTag=$IMAGE_TAG \
               --region $AWS_REGION \
               --query 'imageScanStatus.status' \
-              --output text)
-            echo "Scan status (attempt $attempt/18): $status"
-            if [ "$status" = "ACTIVE" ]; then
+              --output text 2>/dev/null || echo "IN_PROGRESS")
+            echo "Scan status (attempt $attempt/18): $STATUS"
+            if [ "$STATUS" = "COMPLETE" ]; then
+              echo "Scan complete."
               exit 0
             fi
-            if [ "$status" = "FAILED" ]; then
+            if [ "$STATUS" = "FAILED" ]; then
               echo "ECR image scan failed." >&2
               exit 1
             fi
@@ -133,25 +134,19 @@ jobs:
 
       - name: Fail build on High or Critical vulnerabilities
         run: |
-          python3 - <<'PY'
-          import json, os, subprocess, sys
-          repo   = os.environ['ECR_REPOSITORY']
-          tag    = os.environ['IMAGE_TAG']
-          region = os.environ['AWS_REGION']
-          out = subprocess.check_output([
-            'aws', 'ecr', 'describe-image-scan-findings',
-            '--repository-name', repo,
-            '--image-id', f'imageTag={tag}',
-            '--region', region,
-            '--output', 'json'
-          ])
-          findings = json.loads(out)
-          counts   = findings.get('imageScanFindings', {}).get('findingSeverityCounts', {})
-          high     = int(counts.get('HIGH', 0))
-          critical = int(counts.get('CRITICAL', 0))
-          print(f'HIGH: {high}  CRITICAL: {critical}')
-          if high > 0 or critical > 0:
-              print('FAIL: High or Critical vulnerabilities detected — blocking deployment.')
-              sys.exit(1)
-          print('PASS: No High or Critical vulnerabilities found.')
-          PY
+          SCAN_RESULTS=$(aws ecr describe-image-scan-findings \
+            --repository-name $ECR_REPOSITORY \
+            --image-id imageTag=$IMAGE_TAG \
+            --region $AWS_REGION \
+            --output json)
+
+          HIGH=$(echo "$SCAN_RESULTS"     | jq '.imageScanFindings.findingSeverityCounts.HIGH     // 0')
+          CRITICAL=$(echo "$SCAN_RESULTS" | jq '.imageScanFindings.findingSeverityCounts.CRITICAL // 0')
+
+          echo "HIGH: $HIGH  CRITICAL: $CRITICAL"
+
+          if [ "$HIGH" -gt 0 ] || [ "$CRITICAL" -gt 0 ]; then
+            echo "FAIL: High or Critical vulnerabilities detected — blocking deployment." >&2
+            exit 1
+          fi
+          echo "PASS: No High or Critical vulnerabilities found."
