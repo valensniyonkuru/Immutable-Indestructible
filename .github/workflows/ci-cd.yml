@@ -1,0 +1,157 @@
+name: Immutable & Indestructible CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: us-east-1
+  CODEARTIFACT_DOMAIN: fincorp-domain
+  CODEARTIFACT_NPM_REPO: fincorp-npm-proxy
+  CODEARTIFACT_PYPI_REPO: fincorp-pypi-proxy
+  ECR_REPOSITORY: fincorp-app-repo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account ID
+        id: aws-account
+        run: |
+          echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Authenticate npm against CodeArtifact
+        run: |
+          aws codeartifact login \
+            --tool npm \
+            --domain $CODEARTIFACT_DOMAIN \
+            --repository $CODEARTIFACT_NPM_REPO \
+            --domain-owner $AWS_ACCOUNT_ID
+
+      - name: Authenticate pip against CodeArtifact
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain $CODEARTIFACT_DOMAIN \
+            --repository $CODEARTIFACT_PYPI_REPO \
+            --domain-owner $AWS_ACCOUNT_ID
+
+      - name: Install npm dependencies
+        working-directory: ./app
+        run: npm install
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin \
+              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Ensure ECR repository exists
+        run: |
+          if ! aws ecr describe-repositories \
+               --repository-names $ECR_REPOSITORY \
+               --region $AWS_REGION >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name $ECR_REPOSITORY \
+              --image-tag-mutability IMMUTABLE \
+              --image-scanning-configuration scanOnPush=true \
+              --region $AWS_REGION
+          fi
+
+      - name: Build and tag Docker image
+        run: |
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Push image to ECR
+        run: |
+          docker push \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Start ECR image scan
+        run: |
+          aws ecr start-image-scan \
+            --repository-name $ECR_REPOSITORY \
+            --image-id imageTag=$IMAGE_TAG \
+            --region $AWS_REGION
+
+      - name: Wait for image scan to complete
+        run: |
+          for attempt in {1..18}; do
+            status=$(aws ecr describe-image-scan-findings \
+              --repository-name $ECR_REPOSITORY \
+              --image-id imageTag=$IMAGE_TAG \
+              --region $AWS_REGION \
+              --query 'imageScanStatus.status' \
+              --output text)
+            echo "Scan status (attempt $attempt/18): $status"
+            if [ "$status" = "ACTIVE" ]; then
+              exit 0
+            fi
+            if [ "$status" = "FAILED" ]; then
+              echo "ECR image scan failed." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Image scan did not complete within 3 minutes." >&2
+          exit 1
+
+      - name: Fail build on High or Critical vulnerabilities
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          repo   = os.environ['ECR_REPOSITORY']
+          tag    = os.environ['IMAGE_TAG']
+          region = os.environ['AWS_REGION']
+          out = subprocess.check_output([
+            'aws', 'ecr', 'describe-image-scan-findings',
+            '--repository-name', repo,
+            '--image-id', f'imageTag={tag}',
+            '--region', region,
+            '--output', 'json'
+          ])
+          findings = json.loads(out)
+          counts   = findings.get('imageScanFindings', {}).get('findingSeverityCounts', {})
+          high     = int(counts.get('HIGH', 0))
+          critical = int(counts.get('CRITICAL', 0))
+          print(f'HIGH: {high}  CRITICAL: {critical}')
+          if high > 0 or critical > 0:
+              print('FAIL: High or Critical vulnerabilities detected — blocking deployment.')
+              sys.exit(1)
+          print('PASS: No High or Critical vulnerabilities found.')
+          PY

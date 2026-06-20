@@ -1,0 +1,2 @@
+# Example Python dependency for CodeArtifact pip proxy
+requests>=2.31.0
