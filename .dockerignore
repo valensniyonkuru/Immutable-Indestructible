@@ -1,5 +1,6 @@
 .npmrc
 app/.npmrc
+app/package-lock.json
 .git
 .github
 terraform
