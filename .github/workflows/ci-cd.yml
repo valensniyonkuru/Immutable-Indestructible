@@ -66,6 +66,28 @@ jobs:
             --repository $CODEARTIFACT_PYPI_REPO \
             --domain-owner $AWS_ACCOUNT_ID
 
+      - name: Capture CodeArtifact endpoints and token for Docker build
+        run: |
+          CA_NPM_ENDPOINT=$(aws codeartifact get-repository-endpoint \
+            --domain $CODEARTIFACT_DOMAIN \
+            --repository $CODEARTIFACT_NPM_REPO \
+            --domain-owner $AWS_ACCOUNT_ID \
+            --format npm \
+            --query repositoryEndpoint --output text)
+          CA_PYPI_ENDPOINT=$(aws codeartifact get-repository-endpoint \
+            --domain $CODEARTIFACT_DOMAIN \
+            --repository $CODEARTIFACT_PYPI_REPO \
+            --domain-owner $AWS_ACCOUNT_ID \
+            --format pypi \
+            --query repositoryEndpoint --output text)
+          CA_TOKEN=$(aws codeartifact get-authorization-token \
+            --domain $CODEARTIFACT_DOMAIN \
+            --domain-owner $AWS_ACCOUNT_ID \
+            --query authorizationToken --output text)
+          echo "CA_NPM_ENDPOINT=$CA_NPM_ENDPOINT" >> $GITHUB_ENV
+          echo "CA_TOKEN=$CA_TOKEN" >> $GITHUB_ENV
+          echo "CA_PYPI_INDEX_URL=https://aws:${CA_TOKEN}@${CA_PYPI_ENDPOINT#https://}simple/" >> $GITHUB_ENV
+
       - name: Install npm dependencies
         working-directory: ./app
         run: npm install
@@ -93,7 +115,11 @@ jobs:
 
       - name: Build and tag Docker image
         run: |
-          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+          docker build \
+            --build-arg CA_NPM_ENDPOINT="$CA_NPM_ENDPOINT" \
+            --build-arg CA_TOKEN="$CA_TOKEN" \
+            --build-arg CA_PYPI_INDEX_URL="$CA_PYPI_INDEX_URL" \
+            -t $ECR_REPOSITORY:$IMAGE_TAG .
           docker tag $ECR_REPOSITORY:$IMAGE_TAG \
             $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
